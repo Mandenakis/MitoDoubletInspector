@@ -1,0 +1,34 @@
+test_that("adjudication returns required audit columns without a primary caller", {
+  sim <- md_simulate_typical_dataset(
+    n_per_type = c(cardiomyocyte = 30L, fibroblast = 30L, endothelial = 30L),
+    n_doublets = 10L, n_homotypic = 5L, n_background = 400L, seed = 4L
+  )
+  out <- md_adjudicate(
+    sim, sample_col = "sample", cluster_col = "sim_cluster",
+    run_scdblfinder = FALSE, return_sce = TRUE, n_hvg = 350L,
+    mixture_null_n = 50L, verbose = FALSE, seed = 4L
+  )
+  required <- c(
+    "md_class", "md_decision_tier", "md_identifiability", "md_reason",
+    "md_support_doublet", "md_mixture_p_value", "md_mixture_q_value",
+    "md_rescue_status"
+  )
+  expect_true(all(required %in% colnames(SummarizedExperiment::colData(out))))
+  expect_true(all(SummarizedExperiment::colData(out)$md_mixture_p_value >= 0 &
+                  SummarizedExperiment::colData(out)$md_mixture_p_value <= 1))
+  expect_false(any(grepl("polyploid$", SummarizedExperiment::colData(out)$md_class)))
+})
+
+test_that("benchmark reports doublet subtypes", {
+  sim <- md_simulate_typical_dataset(
+    n_per_type = c(cardiomyocyte = 25L, fibroblast = 25L, endothelial = 25L),
+    n_doublets = 8L, n_homotypic = 4L, n_background = 350L, seed = 5L
+  )
+  bench <- md_benchmark_adjudication(
+    sim, cluster_col = "sim_cluster", truth_col = "truth_class",
+    run_scdblfinder = FALSE, seed = 5L, n_hvg = 300L,
+    mixture_null_n = 40L
+  )
+  expect_true(all(c("heterotypic_doublet_sensitivity", "homotypic_doublet_sensitivity") %in% names(bench$metrics)))
+  expect_true("subtype_confusion" %in% names(bench))
+})

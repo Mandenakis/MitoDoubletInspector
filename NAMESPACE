@@ -1,0 +1,27 @@
+test_that("typical simulator creates auditable ground truth", {
+  sim <- md_simulate_typical_dataset(
+    n_per_type = c(cardiomyocyte = 20L, fibroblast = 20L, endothelial = 20L),
+    n_doublets = 8L, n_homotypic = 5L, n_background = 300L, seed = 7L
+  )
+  expect_s4_class(sim, "SingleCellExperiment")
+  expect_true(all(c("counts", "logcounts") %in% SummarizedExperiment::assayNames(sim)))
+  expect_equal(sum(SummarizedExperiment::colData(sim)$truth_subclass == "heterotypic_doublet"), 8L)
+  expect_equal(sum(SummarizedExperiment::colData(sim)$truth_subclass == "homotypic_doublet"), 5L)
+  expect_true(any(SummarizedExperiment::colData(sim)$truth_subclass == "stress_programme"))
+  expect_true(any(SummarizedExperiment::colData(sim)$truth_subclass == "ambient_contamination"))
+  cd <- as.data.frame(SummarizedExperiment::colData(sim))
+  parent_batch <- setNames(cd$sample, rownames(cd))
+  doublets <- which(cd$truth_class == "doublet")
+  expect_true(all(parent_batch[cd$sim_parent_a[doublets]] == parent_batch[cd$sim_parent_b[doublets]]))
+  expect_true(all(Matrix::colSums(SummarizedExperiment::assay(sim, "counts")) > 0))
+})
+
+test_that("simulators restore the caller RNG", {
+  set.seed(99)
+  initial <- .Random.seed
+  invisible(md_simulate_typical_dataset(
+    n_per_type = c(cardiomyocyte = 10L, fibroblast = 10L),
+    n_doublets = 2L, n_homotypic = 2L, n_background = 250L, seed = 2L
+  ))
+  expect_identical(.Random.seed, initial)
+})

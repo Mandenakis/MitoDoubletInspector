@@ -1,0 +1,286 @@
+# Parent mixture model ---------------------------------------------------------
+
+# Convert a non-negative vector to proportions.
+.md_to_prop <- function(v) {
+  v <- as.numeric(v)
+  v[!is.finite(v) | v < 0] <- 0
+  s <- sum(v)
+  if (s <= 0) return(v)
+  v / s
+}
+
+# Fit best single reference and best two-parent convex mixture for one cell,
+# given proportion-space profiles and precomputed pair geometry.
+.md_mix_one <- function(x, P, p_norm2, pairs, pair_a, pair_b, dP, dP_norm2) {
+  x_norm2 <- sum(x^2)
+  dot_single <- as.numeric(crossprod(P, x))
+  sse_single <- x_norm2 - 2 * dot_single + p_norm2
+  sse_single[!is.finite(sse_single)] <- Inf
+  best_s <- which.min(sse_single)
+
+  PB <- P[, pair_b, drop = FALSE]
+  alpha <- .md_clip(
+    (as.numeric(crossprod(dP, x)) - colSums(dP * PB)) / dP_norm2, 0, 1
+  )
+  best_pair_sse <- rep(Inf, ncol(pairs))
+  for (pp in seq_len(ncol(pairs))) {
+    mix <- alpha[pp] * P[, pair_a[pp]] + (1 - alpha[pp]) * P[, pair_b[pp]]
+    best_pair_sse[pp] <- sum((x - mix)^2)
+  }
+  bp <- which.min(best_pair_sse)
+  s_sse <- sse_single[best_s]
+  d_sse <- best_pair_sse[bp]
+  improvement <- pmax(0, (s_sse - d_sse) / pmax(s_sse, .Machine$double.eps))
+  a <- alpha[bp]
+  list(
+    A = colnames(P)[pair_a[bp]], B = colnames(P)[pair_b[bp]],
+    alpha = a, minor = min(a, 1 - a),
+    singlet_sse = s_sse, doublet_sse = d_sse, improvement = improvement
+  )
+}
+
+#' Fit parent-mixture models for suspicious cells
+#'
+#' Compares a best single-reference fit to the best two-parent convex mixture in
+#' expression-proportion space. The raw mixture improvement is then calibrated
+#' against a null of high-confidence singlets (how much a genuine singlet's fit
+#' improves simply by being allowed two profiles) and gated by a minimum
+#' minority-parent contribution. The calibrated value in `md_mixture_improvement`
+#' is therefore a *specific* doublet signal, not merely the benefit of an extra
+#' degree of freedom.
+#'
+#' @param sce SingleCellExperiment.
+#' @param candidates "flagged_or_extreme", "all", logical vector, or cell names.
+#' @param mixture_space "proportion" (default) or "log".
+#' @param min_alpha Minimum minority-parent contribution for a mixture to count
+#'   as genuine doublet evidence.
+#' @param null_n Number of high-confidence singlets used to calibrate the null
+#'   mixture improvement.
+#' @param null_quantile Null quantile subtracted from raw improvement.
+#' @param max_candidates Maximum number of cells to fit, protecting runtime.
+#' @param seed Random seed for null-set sampling.
+#' @param verbose Logical.
+#' @return SingleCellExperiment.
+#' @export
+md_fit_parent_mixture_models <- function(
+  sce,
+  candidates = "flagged_or_extreme",
+  mixture_space = c("proportion", "log"),
+  min_alpha = 0.15,
+  null_n = 300L,
+  null_quantile = 0.95,
+  max_candidates = 10000L,
+  seed = 1234L,
+  verbose = TRUE
+) {
+  mixture_space <- match.arg(mixture_space)
+  if (!is.numeric(min_alpha) || length(min_alpha) != 1L || !is.finite(min_alpha) ||
+      min_alpha < 0 || min_alpha > 0.5) {
+    .md_stop("min_alpha must be one finite value between 0 and 0.5.")
+  }
+  if (!is.numeric(null_quantile) || length(null_quantile) != 1L ||
+      !is.finite(null_quantile) || null_quantile <= 0 || null_quantile >= 1) {
+    .md_stop("null_quantile must be one finite value strictly between 0 and 1.")
+  }
+  if (!is.numeric(null_n) || length(null_n) != 1L || !is.finite(null_n) || null_n < 20L) {
+    .md_stop("null_n must be a finite value of at least 20.")
+  }
+  if (!is.numeric(max_candidates) || length(max_candidates) != 1L ||
+      !is.finite(max_candidates) || max_candidates < 1L) {
+    .md_stop("max_candidates must be a positive finite value.")
+  }
+  profiles <- metadata(sce)$md_identity_profiles
+  prop_profiles <- metadata(sce)$md_identity_proportions
+  features <- metadata(sce)$md_identity_features
+  if (is.null(profiles) || is.null(features)) .md_stop("No identity profiles found. Run md_build_identity_reference() first.")
+
+  features <- intersect(features, rownames(sce))
+  Xlog <- .md_sparse(assay(sce, "logcounts"))[features, , drop = FALSE]
+  Plog <- as.matrix(profiles[features, , drop = FALSE])
+  k <- ncol(Plog)
+
+  if (identical(mixture_space, "proportion")) {
+    if (is.null(prop_profiles)) {
+      .md_warn_once("legacy_reference_proportions", "Count-proportion identity profiles were absent; reconstructing approximate profiles from logcounts.")
+      P <- apply(expm1(Plog), 2, .md_to_prop)
+    } else {
+      P <- as.matrix(prop_profiles[features, , drop = FALSE])
+      P <- apply(P, 2, .md_to_prop)
+    }
+    Xcount <- .md_sparse(.md_get_counts(sce))[features, , drop = FALSE]
+    getx <- function(j) .md_to_prop(as.numeric(Xcount[, j]))
+  } else {
+    P <- Plog
+    getx <- function(j) as.numeric(Xlog[, j])
+  }
+
+  n <- ncol(sce)
+  md_parent_A <- md_parent_B <- rep(NA_character_, n)
+  md_parent_alpha <- md_minor <- rep(NA_real_, n)
+  md_singlet_sse <- md_doublet_sse <- rep(NA_real_, n)
+  md_improve_raw <- rep(0, n)
+  md_mixture_p <- md_mixture_q <- rep(1, n)
+
+  cd <- .md_coldata_df(sce)
+  if (k < 2L) {
+    colData(sce)$md_parent_A <- md_parent_A
+    colData(sce)$md_parent_B <- md_parent_B
+    colData(sce)$md_parent_alpha <- md_parent_alpha
+    colData(sce)$md_mixture_minor_alpha <- md_minor
+    colData(sce)$md_singlet_sse <- md_singlet_sse
+    colData(sce)$md_doublet_sse <- md_doublet_sse
+    colData(sce)$md_mixture_improvement_raw <- md_improve_raw
+    colData(sce)$md_mixture_improvement <- md_improve_raw
+    colData(sce)$md_mixture_p_value <- md_mixture_p
+    colData(sce)$md_mixture_q_value <- md_mixture_q
+    colData(sce)$md_mixture_evidence <- md_improve_raw
+    return(sce)
+  }
+
+  cand_idx <- .md_candidate_indices(sce, candidates)
+  if (length(cand_idx) > max_candidates) {
+    ord <- order(.md_candidate_priority(cd[cand_idx, , drop = FALSE]), decreasing = TRUE)
+    cand_idx <- cand_idx[ord[seq_len(max_candidates)]]
+    .md_warn_once("candidate_cap", "Candidate cells exceeded max_candidates; highest-priority cells were modelled.")
+  }
+  .md_msg("Fitting parent-mixture models for ", length(cand_idx), " candidate cells (", mixture_space, " space)...", verbose = verbose)
+
+  # Pair geometry (shared across cells).
+  pairs <- utils::combn(seq_len(k), 2L)
+  p_norm2 <- colSums(P^2)
+  pair_a <- pairs[1, ]
+  pair_b <- pairs[2, ]
+  dP <- P[, pair_a, drop = FALSE] - P[, pair_b, drop = FALSE]
+  dP_norm2 <- colSums(dP^2)
+  dP_norm2[dP_norm2 == 0 | !is.finite(dP_norm2)] <- .Machine$double.eps
+
+  fit_cells <- function(idx) {
+    res <- vector("list", length(idx))
+    for (ii in seq_along(idx)) {
+      res[[ii]] <- .md_mix_one(getx(idx[ii]), P, p_norm2, pairs, pair_a, pair_b, dP, dP_norm2)
+    }
+    res
+  }
+
+  if (length(cand_idx)) {
+    fits <- fit_cells(cand_idx)
+    for (ii in seq_along(cand_idx)) {
+      j <- cand_idx[ii]; f <- fits[[ii]]
+      md_parent_A[j] <- f$A; md_parent_B[j] <- f$B
+      md_parent_alpha[j] <- f$alpha; md_minor[j] <- f$minor
+      md_singlet_sse[j] <- f$singlet_sse; md_doublet_sse[j] <- f$doublet_sse
+      md_improve_raw[j] <- f$improvement
+    }
+  }
+
+  # Empirical null calibration accounts for both the extra mixture parameter and
+  # the search across all identity pairs. A median correction is insufficient:
+  # with many clusters, ordinary singlets can obtain non-trivial improvements by
+  # chance simply because more parent pairs were searched.
+  null_median <- 0
+  null_cutoff <- 0
+  coh <- if ("md_identity_coherence" %in% colnames(cd)) cd$md_identity_coherence else rep(0, n)
+  is_flagged <- rep(FALSE, n); is_flagged[cand_idx] <- TRUE
+  coh_thr <- .md_safe_quantile(coh, 0.5, default = -Inf)
+  null_pool <- which(!is_flagged & coh >= coh_thr)
+  if ("md_original_doublet_class" %in% colnames(cd)) {
+    null_pool <- null_pool[!tolower(as.character(cd$md_original_doublet_class[null_pool])) %in% c("doublet", "multiplet")]
+  }
+  null_improve <- numeric()
+  if (length(null_pool) >= 20L) {
+    null_idx <- .md_with_seed(seed, {
+      take <- min(as.integer(null_n), length(null_pool))
+      null_pool[sample.int(length(null_pool), take)]
+    })
+    null_fits <- fit_cells(null_idx)
+    null_improve <- vapply(null_fits, function(z) z$improvement, numeric(1))
+    null_median <- stats::median(null_improve, na.rm = TRUE)
+    null_cutoff <- .md_safe_quantile(null_improve, null_quantile, default = null_median)
+  } else {
+    .md_warn_once("small_mixture_null", "Fewer than 20 high-confidence singlets were available for mixture calibration; mixture evidence will be conservative.")
+  }
+
+  gate <- as.numeric(!is.na(md_minor) & md_minor >= min_alpha)
+  md_mixture_improvement <- pmax(0, md_improve_raw - null_cutoff) * gate
+  if (length(null_improve)) {
+    for (j in cand_idx) {
+      # A statistically good two-profile fit is not doublet evidence if the
+      # fitted second parent is negligible. Keep such cells at p = 1 so the
+      # downstream classifier cannot recover the ungated signal via 1 - p.
+      if (gate[j] > 0) {
+        md_mixture_p[j] <- (1 + sum(null_improve >= md_improve_raw[j])) / (1 + length(null_improve))
+      }
+    }
+    md_mixture_q[cand_idx] <- stats::p.adjust(md_mixture_p[cand_idx], method = "BH")
+  }
+
+  # Non-candidate cells keep their identity top/second as nominal parents.
+  not_cand <- setdiff(seq_len(n), cand_idx)
+  if (length(not_cand)) {
+    if ("md_identity_top" %in% colnames(cd)) md_parent_A[not_cand] <- cd$md_identity_top[not_cand]
+    if ("md_identity_second" %in% colnames(cd)) md_parent_B[not_cand] <- cd$md_identity_second[not_cand]
+  }
+
+  colData(sce)$md_parent_A <- md_parent_A
+  colData(sce)$md_parent_B <- md_parent_B
+  colData(sce)$md_parent_alpha <- md_parent_alpha
+  colData(sce)$md_mixture_minor_alpha <- md_minor
+  colData(sce)$md_singlet_sse <- md_singlet_sse
+  colData(sce)$md_doublet_sse <- md_doublet_sse
+  colData(sce)$md_mixture_improvement_raw <- md_improve_raw
+  colData(sce)$md_mixture_improvement <- md_mixture_improvement
+  colData(sce)$md_mixture_p_value <- md_mixture_p
+  colData(sce)$md_mixture_q_value <- md_mixture_q
+  colData(sce)$md_mixture_evidence <- md_mixture_improvement * pmax(0, -log10(pmax(md_mixture_p, .Machine$double.xmin)))
+
+  mdmeta <- metadata(sce)
+  mdmeta$md_mixture_null_median <- null_median
+  mdmeta$md_mixture_null_cutoff <- null_cutoff
+  mdmeta$md_mixture_null_n <- length(null_improve)
+  mdmeta$md_mixture_space <- mixture_space
+  metadata(sce) <- mdmeta
+  sce
+}
+
+.md_candidate_indices <- function(sce, candidates) {
+  n <- ncol(sce)
+  cd <- .md_coldata_df(sce)
+  if (is.logical(candidates)) {
+    if (length(candidates) != n) .md_stop("Logical candidates must have length ncol(sce).")
+    return(which(candidates))
+  }
+  if (is.character(candidates) && length(candidates) > 1L) {
+    idx <- unique(match(candidates, colnames(sce), nomatch = 0L))
+    return(idx[idx > 0L])
+  }
+  if (identical(candidates, "all")) return(seq_len(n))
+  if (!identical(candidates, "flagged_or_extreme")) .md_stop("Unsupported candidates argument.")
+
+  flag <- rep(FALSE, n)
+  if ("md_original_doublet_class" %in% colnames(cd)) {
+    flag <- flag | tolower(cd$md_original_doublet_class) %in% c("doublet", "multiplet")
+  }
+  if ("md_doublet_score_full" %in% colnames(cd)) {
+    if (.md_has_variation(cd$md_doublet_score_full)) {
+      flag <- flag | cd$md_doublet_score_full > .md_safe_quantile(cd$md_doublet_score_full, 0.90, default = Inf)
+    }
+  }
+  if ("md_nCount" %in% colnames(cd)) {
+    flag <- flag | cd$md_nCount > .md_safe_quantile(cd$md_nCount, 0.95, default = Inf)
+  }
+  if ("md_cycle_score" %in% colnames(cd)) {
+    flag <- flag | cd$md_cycle_score > .md_safe_quantile(cd$md_cycle_score, 0.95, default = Inf)
+  }
+  if ("md_rna_residual" %in% colnames(cd)) {
+    flag <- flag | cd$md_rna_residual > .md_safe_quantile(cd$md_rna_residual, 0.95, default = Inf)
+  }
+  which(flag)
+}
+
+.md_candidate_priority <- function(cd) {
+  score <- rep(0, nrow(cd))
+  for (nm in c("md_doublet_score_full", "md_cycle_score", "md_nCount", "md_rna_residual")) {
+    if (nm %in% colnames(cd)) score <- score + .md_z(cd[[nm]])
+  }
+  score
+}
